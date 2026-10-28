@@ -32,10 +32,12 @@ class SelectionRequest:
     variables: dict[str, Any] = field(default_factory=dict)
     options: tuple[ActionCandidate, ...] | None = None
     messages: list[ChatMessage] = field(default_factory=list)
-    protocol: Literal["executor", "xml"] = "xml"
+    protocol: Literal["executor", "xml", "native"] = "xml"
     param_types: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     instructions: str = ""
+    tool_specs: list[dict[str, Any]] | None = None
+    parallel_tools: bool = True
 
     def get_decision_prompt_variables(self) -> dict[str, Any]:
         """Describe selectable capabilities for decision prompt templates."""
@@ -76,6 +78,11 @@ class ActionSelection:
 
 class ActionSelector(ABC):
     """Explicit action-selection and capability contract."""
+
+    @property
+    def supports_native_tool_calls(self) -> bool:
+        """Whether native tool-call messages can be used throughout this selector."""
+        return False
 
     @property
     @abstractmethod

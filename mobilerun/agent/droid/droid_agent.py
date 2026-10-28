@@ -65,7 +65,11 @@ from mobilerun.agent.selectors import (
     LlamaIndexLLMSelector,
 )
 from mobilerun.agent.trajectory import TrajectoryWriter
-from mobilerun.agent.utils.android_device import resolve_android_serial
+from mobilerun.agent.utils.android_device import (
+    create_android_portal_http_driver,
+    is_portal_http_url,
+    resolve_android_serial,
+)
 from mobilerun.agent.utils.decision_loader import load_agent_decision_models
 from mobilerun.agent.utils.errors import describe_error
 from mobilerun.agent.utils.llm_loader import load_agent_llms, merge_llms_with_config
@@ -74,8 +78,8 @@ from mobilerun.agent.utils.prompt_resolver import PromptResolver
 from mobilerun.agent.utils.selector_loader import load_delegating_selector
 from mobilerun.agent.utils.signatures import build_tool_registry
 from mobilerun.agent.utils.tracing_setup import (
-    apply_session_context,
     record_langfuse_screenshot,
+    session_context,
     setup_tracing,
 )
 from mobilerun.agent.utils.trajectory import Trajectory
@@ -272,6 +276,9 @@ class MobileAgent(Workflow):
     - reasoning=True: Uses ManagerAgent (planning) + ExecutorAgent (actions)
     """
 
+    _tracing_session_id: str | None = None
+    _tracing_user_id: str | None = None
+
     @staticmethod
     def _configure_default_logging(debug: bool = False):
         """
@@ -424,6 +431,8 @@ class MobileAgent(Workflow):
         }
         super().__init__(*args, timeout=timeout, **workflow_kwargs)
 
+        self._tracing_session_id = self.config.tracing.langfuse_session_id
+        self._tracing_user_id = self.config.tracing.langfuse_user_id
         setup_tracing(self.config.tracing, agent=self)
 
         # Check if using external agent - skip LLM loading
@@ -586,9 +595,11 @@ class MobileAgent(Workflow):
         return action_selector
 
     def run(self, *args, **kwargs) -> Awaitable[ResultEvent] | WorkflowHandler:
-        apply_session_context()
-        handler = super().run(*args, **kwargs)  # type: ignore[assignment]
-        return handler
+        # Workflow tasks inherit this context when run() schedules them.
+        with session_context(
+            self._tracing_session_id, self._tracing_user_id, agent=self
+        ):
+            return super().run(*args, **kwargs)
 
     async def _initialize_workflow_deadline(self, ctx: Context) -> None:
         """Store a deadline owned by the runtime execution of this run."""
@@ -657,6 +668,11 @@ class MobileAgent(Workflow):
 
             # Resolve device serial and get raw AdbDevice
             device_serial = self.resolved_device_config.serial
+            if is_portal_http_url(device_serial):
+                raise ValueError(
+                    "External agents need an ADB device; a Portal HTTP URL is "
+                    "not supported."
+                )
             if device_serial is None:
                 device_serial = await resolve_android_serial()
                 logger.info(f"📱 Using device: {device_serial}")
@@ -770,6 +786,14 @@ class MobileAgent(Workflow):
             driver = await create_ios_driver(
                 ios_url,
                 token=self.resolved_device_config.resolve_auth_token(),
+            )
+            await driver.connect()
+        elif is_portal_http_url(self.resolved_device_config.serial):
+            # Portal HTTP talks to the app directly: no ADB serial, auto-setup,
+            # or keyboard cleanup.
+            driver = create_android_portal_http_driver(
+                self.resolved_device_config.serial,
+                self.resolved_device_config.resolve_auth_token(),
             )
             await driver.connect()
         else:
@@ -936,7 +960,11 @@ class MobileAgent(Workflow):
             self.executor_agent.action_ctx = self.action_ctx
 
         # ── 6. Fetch device date once ─────────────────────────────────
-        self.shared_state.device_date = await driver.get_date()
+        try:
+            self.shared_state.device_date = await driver.get_date()
+        except NotImplementedError:
+            # Optional prompt context; older Portal HTTP drivers have no date.
+            self.shared_state.device_date = ""
 
         # ── 7. Telemetry init event ───────────────────────────────────
         action_model_names = ",".join(

@@ -27,17 +27,30 @@ class LlamaIndexLLMSelector(BaseActionSelector):
     def llms(self) -> tuple[LLM, ...]:
         return (self.llm,)
 
+    @property
+    def supports_native_tool_calls(self) -> bool:
+        return bool(getattr(self.llm, "supports_native_tool_calls", False))
+
     async def select(self, request: SelectionRequest) -> ActionSelection | None:
         from mobilerun.agent.executor.prompts import parse_executor_response
+        from mobilerun.agent.fast_agent.native_tools import (
+            native_tool_kwargs,
+            parse_native_tool_calls,
+        )
         from mobilerun.agent.fast_agent.xml_parser import ToolCall, parse_tool_calls_detailed
 
         if not request.messages:
             raise ValueError("LLM selection requires messages in the request")
-        if request.protocol not in {"executor", "xml"}:
+        if request.protocol not in {"executor", "xml", "native"}:
             raise ValueError(f"Unknown selection protocol: {request.protocol}")
+        chat_kwargs = {}
+        if request.protocol == "native":
+            chat_kwargs = native_tool_kwargs(
+                self.llm, request.tool_specs or [], request.parallel_tools
+            )
         try:
             response = await acall_with_retries(
-                self.llm, request.messages, stream=request.stream
+                self.llm, request.messages, stream=request.stream, **chat_kwargs
             )
         except ValueError as e:
             if request.protocol != "executor":
@@ -100,7 +113,10 @@ class LlamaIndexLLMSelector(BaseActionSelector):
                 response_text=str(response),
             )
 
-        parsed = parse_tool_calls_detailed(response.message.content, request.param_types)
+        if request.protocol == "native":
+            parsed = parse_native_tool_calls(response.message, request.param_types)
+        else:
+            parsed = parse_tool_calls_detailed(response.message.content, request.param_types)
         return ActionSelection(
             actions=parsed.calls,
             thought=parsed.thought,
